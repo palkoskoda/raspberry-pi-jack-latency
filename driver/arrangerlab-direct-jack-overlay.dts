@@ -1,0 +1,17 @@
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "raspberrypi,3-model-b";
+
+	fragment@0 {
+		target = <&pwm>;
+		__overlay__ {
+			compatible = "arrangerlab,bcm2835-direct-jack";
+			dmas = <&dma 5>;
+			dma-names = "tx";
+			arrangerlab,firmware-audio-disabled;
+			status = "okay";
+		};
+	};
+};
