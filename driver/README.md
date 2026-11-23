@@ -34,4 +34,10 @@ Run the [silent ALSA example](../examples/README.md) on `hw:CARD=DirectJack,DEV=
 - `.ack` encodes newly committed little-endian stereo PCM frames into interleaved PWM duties and publishes the data before the consumer reaches it. The kernel driver advertises that rewinds are unsupported.
 - `.trigger` configures the FIFO and starts DMA. `.pointer` derives the PCM position from DMA residue. Period callbacks wake ALSA clients. Scheduling and hardware FIFO movement still limit timing around the pointer.
 
+## Quiet PCM start and stop
+
+The original module disabled PWM on PCM Stop. Its digital silence used 50% duty, so turning the carrier off changed the analog bias even during silence. The updated module keeps both channels transmitting the midpoint from the static duty registers whenever DMA is idle. PCM Start primes one neutral stereo carrier pair before switching to the FIFO. An eased, sleepable bias ramp runs only when the module takes or releases the device. The PCM trigger and underrun recovery retain their short path.
+
+On the same Pi 3 and kernel, the updated module completed three silent open/close cycles at 88.2 kHz and 32 frames per period. The listener reported that the pop was gone. A faint sound was reported around the automatic return to the normal boot. Isolating that transition still requires recording the load, unload and reboot separately. The same module delivered a 3.662 ms p95 for 22 live Copilot chord attacks from complete MIDI receipt to estimated DMA. [Implementation](direct_jack.c)
+
 See [the main article](../README.md#why-the-pi-3-driver-mattered) for the clock and duty quantization rationale. The public repository contains source only. Use headers for the running kernel and test on the exact board before relying on it for a performance.
