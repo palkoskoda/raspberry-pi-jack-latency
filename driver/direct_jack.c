@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Experimental ALSA playback through the Pi 3 PWM FIFO and a cyclic DMA ring. */
 #include <linux/clk.h>
+#include <linux/delay.h>
 #include <linux/dmaengine.h>
 #include <linux/dma-mapping.h>
 #include <linux/io.h>
@@ -14,6 +15,8 @@
 #define BASE_SAMPLE_RATE 44100
 #define PWM_MAX_REPEAT 4
 #define PWM_RANGE 560
+#define PWM_MIDPOINT (PWM_RANGE / 2)
+#define BIAS_RAMP_STEPS 80U
 #define PWM_FRACTION_BITS 15
 #define PWM_FRACTION_MASK ((1U << PWM_FRACTION_BITS) - 1)
 #define PWM_CLOCK (BASE_SAMPLE_RATE * PWM_MAX_REPEAT * PWM_RANGE)
@@ -23,11 +26,14 @@
 #define PWM_STA 0x04
 #define PWM_DMAC 0x08
 #define PWM_RNG1 0x10
+#define PWM_DAT1 0x14
 #define PWM_FIFO 0x18
 #define PWM_RNG2 0x20
+#define PWM_DAT2 0x24
 #define PWM_CLR_FIFO BIT(6)
 #define PWM_FIFO_ERRORS (BIT(8) | BIT(5) | BIT(4) | BIT(3) | BIT(2))
-#define PWM_STEREO_FIFO (BIT(0) | BIT(5) | BIT(7) | BIT(8) | BIT(13) | BIT(15))
+#define PWM_STEREO_STATIC (BIT(0) | BIT(7) | BIT(8) | BIT(15))
+#define PWM_STEREO_FIFO (PWM_STEREO_STATIC | BIT(5) | BIT(13))
 #define PWM_DMA_REQUEST (BIT(31) | (7 << 8) | 7)
 
 struct direct_jack {
@@ -43,6 +49,7 @@ struct direct_jack {
 	u32 left_fraction;
 	u32 right_fraction;
 	bool running;
+	bool biased;
 };
 
 static const struct snd_pcm_hardware direct_hw = {
@@ -77,6 +84,47 @@ static void direct_period(void *context)
 		snd_pcm_period_elapsed(substream);
 }
 
+static void direct_set_bias(struct direct_jack *jack, u32 duty)
+{
+	writel(duty, jack->regs + PWM_DAT1);
+	writel(duty, jack->regs + PWM_DAT2);
+}
+
+/* Only the device lifecycle changes the DC bias. PCM stop and XRUN keep
+ * both PWM channels transmitting the silent duty with no DMA or FIFO.
+ */
+static void direct_ramp_bias(struct direct_jack *jack, bool up)
+{
+	unsigned int n;
+
+	for (n = 1; n <= BIAS_RAMP_STEPS; n++) {
+		unsigned int step = up ? n : BIAS_RAMP_STEPS - n;
+		unsigned int weight = step * step * (3 * BIAS_RAMP_STEPS - 2 * step);
+		u32 duty = DIV_ROUND_CLOSEST(PWM_MIDPOINT * weight,
+				BIAS_RAMP_STEPS * BIAS_RAMP_STEPS * BIAS_RAMP_STEPS);
+
+		direct_set_bias(jack, duty);
+		usleep_range(800, 1200);
+	}
+}
+
+static void direct_idle(struct direct_jack *jack)
+{
+	WRITE_ONCE(jack->running, false);
+	writel(PWM_STEREO_STATIC, jack->regs + PWM_CTL);
+	writel(0, jack->regs + PWM_DMAC);
+}
+
+static void direct_remove_bias(struct direct_jack *jack)
+{
+	if (!jack->biased)
+		return;
+	direct_idle(jack);
+	direct_ramp_bias(jack, false);
+	writel(0, jack->regs + PWM_CTL);
+	jack->biased = false;
+}
+
 static int direct_prepare(struct snd_pcm_substream *substream)
 {
 	struct direct_jack *jack = snd_pcm_substream_chip(substream);
@@ -90,7 +138,7 @@ static int direct_prepare(struct snd_pcm_substream *substream)
 	jack->pwm_repeat = PWM_MAX_REPEAT * BASE_SAMPLE_RATE / rt->rate;
 	frame_bytes = 2 * jack->pwm_repeat * sizeof(*jack->samples);
 	for (i = 0; i < rt->buffer_size * 2 * jack->pwm_repeat; i++)
-		jack->samples[i] = PWM_RANGE / 2;
+		jack->samples[i] = PWM_MIDPOINT;
 	/* ALSA resets hw_ptr and appl_ptr after this callback returns. */
 	jack->appl_ptr = 0;
 	jack->left_fraction = 0;
@@ -158,19 +206,21 @@ static int direct_trigger(struct snd_pcm_substream *substream, int command)
 
 	switch (command) {
 	case SNDRV_PCM_TRIGGER_START:
-		writel(PWM_CLR_FIFO, jack->regs + PWM_CTL);
+		/* Keep PWEN and the static midpoint while clearing the shared
+		 * FIFO. Seed one stereo carrier cycle until DMA delivers PCM.
+		 * These two words are outside the ALSA DMA ring.
+		 */
+		writel(PWM_STEREO_STATIC | PWM_CLR_FIFO, jack->regs + PWM_CTL);
 		writel(PWM_FIFO_ERRORS, jack->regs + PWM_STA);
-		writel(PWM_RANGE, jack->regs + PWM_RNG1);
-		writel(PWM_RANGE, jack->regs + PWM_RNG2);
+		writel(PWM_MIDPOINT, jack->regs + PWM_FIFO);
+		writel(PWM_MIDPOINT, jack->regs + PWM_FIFO);
 		writel(PWM_DMA_REQUEST, jack->regs + PWM_DMAC);
 		WRITE_ONCE(jack->running, true);
 		dma_async_issue_pending(jack->tx);
 		writel(PWM_STEREO_FIFO, jack->regs + PWM_CTL);
 		return 0;
 	case SNDRV_PCM_TRIGGER_STOP:
-		WRITE_ONCE(jack->running, false);
-		writel(0, jack->regs + PWM_DMAC);
-		writel(0, jack->regs + PWM_CTL);
+		direct_idle(jack);
 		return dmaengine_terminate_async(jack->tx);
 	default:
 		return -EINVAL;
@@ -233,8 +283,7 @@ static void direct_release_clock(void *context)
 {
 	struct direct_jack *jack = context;
 
-	writel(0, jack->regs + PWM_DMAC);
-	writel(0, jack->regs + PWM_CTL);
+	direct_remove_bias(jack);
 	clk_disable_unprepare(jack->clock);
 	clk_rate_exclusive_put(jack->clock);
 }
@@ -310,9 +359,33 @@ static int direct_probe(struct platform_device *pdev)
 	strscpy(card->driver, "DirectJack", sizeof(card->driver));
 	strscpy(card->shortname, "Direct PWM Jack", sizeof(card->shortname));
 	strscpy(card->longname, "Raspberry Pi 3 direct PWM DMA jack", sizeof(card->longname));
+	/* Acquire the carrier only after the clock, DMA and PCM are ready;
+	 * earlier probe failures must leave the pins as they were.
+	 */
+	writel(0, jack->regs + PWM_DMAC);
+	writel(PWM_RANGE, jack->regs + PWM_RNG1);
+	writel(PWM_RANGE, jack->regs + PWM_RNG2);
+	direct_set_bias(jack, 0);
+	writel(PWM_STEREO_STATIC, jack->regs + PWM_CTL);
+	jack->biased = true;
+	direct_ramp_bias(jack, true);
+	platform_set_drvdata(pdev, card);
 	dev_info(dev, "PWM clock=%lu Hz, PCM rates 44100/88200 Hz, DREQ-backed cyclic DMA\n",
 		 pwm_clock);
 	return snd_card_register(card);
+}
+
+static void direct_shutdown(struct platform_device *pdev)
+{
+	struct snd_card *card = platform_get_drvdata(pdev);
+	struct direct_jack *jack = card->private_data;
+
+	/* Disconnect stops PCM under the stream lock and prevents a restart
+	 * while the carrier ramps down for a normal reboot or poweroff.
+	 */
+	snd_card_disconnect(card);
+	dmaengine_terminate_sync(jack->tx);
+	direct_remove_bias(jack);
 }
 
 static const struct of_device_id direct_ids[] = {
@@ -323,6 +396,7 @@ MODULE_DEVICE_TABLE(of, direct_ids);
 
 static struct platform_driver direct_driver = {
 	.probe = direct_probe,
+	.shutdown = direct_shutdown,
 	.driver = {
 		.name = "arrangerlab-direct-jack",
 		.of_match_table = direct_ids,
